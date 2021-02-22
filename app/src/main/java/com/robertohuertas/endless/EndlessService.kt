@@ -1,9 +1,11 @@
 package com.robertohuertas.endless
 
+import android.annotation.SuppressLint
 import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
+import android.location.Location
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -14,13 +16,17 @@ import java.text.SimpleDateFormat
 import java.util.*
 import com.github.kittinunf.fuel.Fuel
 import com.github.kittinunf.fuel.core.extensions.jsonBody
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationServices
 import kotlinx.coroutines.*
+import org.json.JSONObject
 
 
 class EndlessService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var isServiceStarted = false
+    private lateinit var fusedLocationClient: FusedLocationProviderClient
 
     override fun onBind(intent: Intent): IBinder? {
         log("Some component want to bind with the service")
@@ -52,6 +58,8 @@ class EndlessService : Service() {
         log("The service has been created".toUpperCase())
         val notification = createNotification()
         startForeground(1, notification)
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+
     }
 
     override fun onDestroy() {
@@ -90,6 +98,7 @@ class EndlessService : Service() {
             while (isServiceStarted) {
                 launch(Dispatchers.IO) {
                     pingFakeServer()
+                    requestLastLocation()
                 }
                 delay(1 * 60 * 1000)
             }
@@ -97,6 +106,19 @@ class EndlessService : Service() {
         }
     }
 
+    @SuppressLint("MissingPermission", "HardwareIds")
+    private fun requestLastLocation(){
+        fusedLocationClient.lastLocation
+            .addOnSuccessListener { location : Location? ->
+            val json = JSONObject();
+                json.put("latitude", location?.latitude)
+                json.put("longitude", location?.longitude)
+                json.put("data_computador_bordo", location?.time)
+                json.put("terminal",  Settings.Secure.getString(applicationContext.contentResolver, Settings.Secure.ANDROID_ID))
+
+            sendRequest("http://ec2-54-233-86-218.sa-east-1.compute.amazonaws.com:3000/api/posicoes", json.toString())
+            }
+    }
     private fun stopService() {
         log("Stopping the foreground service")
         Toast.makeText(this, "Service stopping", Toast.LENGTH_SHORT).show()
@@ -128,8 +150,12 @@ class EndlessService : Service() {
                     "createdAt": "$gmtTime"
                 }
             """
+        sendRequest("http://ec2-54-233-86-218.sa-east-1.compute.amazonaws.com:3000/api/log", json)
+    }
+
+    private fun sendRequest(url:String, json: String) {
         try {
-            Fuel.post("https://jsonplaceholder.typicode.com/posts")
+            Fuel.post(url)
                 .jsonBody(json)
                 .response { _, _, result ->
                     val (bytes, error) = result
