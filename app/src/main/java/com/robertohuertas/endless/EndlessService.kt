@@ -100,6 +100,7 @@ class EndlessService : Service() {
         }
     }
 
+    @SuppressLint("SimpleDateFormat")
     private fun salvarPosicao(location: Location) {
         val locationDao = LocationDao()
         locationDao.longitude = location.longitude
@@ -190,6 +191,10 @@ class EndlessService : Service() {
 
     @SuppressLint("HardwareIds", "SimpleDateFormat")
     private fun saveLog() {
+
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+
+
         val gmtTime =
             SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.mmmZ").format(Date(System.currentTimeMillis()))
 
@@ -204,6 +209,9 @@ class EndlessService : Service() {
         log.version = 4
         log.enviado = 0
         log.log = getLocation()
+        log.isPowerSaveMode = pm.isPowerSaveMode
+        log.isDeviceIdleMode = pm.isDeviceIdleMode
+        log.isIgnoringBatteryOptimizations = pm.isIgnoringBatteryOptimizations(packageName)
         log.save()
 
         pingFakeServer()
@@ -259,6 +267,7 @@ class EndlessService : Service() {
                 )
             )
             json.put("creationDate", location?.creationDate)
+            json.put("modelo", """${Build.MANUFACTURER} ${Build.MODEL}""")
 
             jsonArray.put(json)
         }
@@ -300,8 +309,13 @@ class EndlessService : Service() {
             json.put("data_computador_bordo", log.data_computador_bordo)
             json.put("version", log.version)
             json.put("log", log.log)
-            jsonArray.put(json)
+            json.put("isPowerSaveMode", log.isPowerSaveMode)
+            json.put("isDeviceIdleMode", log.isDeviceIdleMode)
+            json.put("isIgnoringBatteryOptimizations", log.isIgnoringBatteryOptimizations)
+            json.put("creationDate", log.creationDate)
+            json.put("modelo", """${Build.MANUFACTURER} ${Build.MODEL}""")
 
+            jsonArray.put(json)
         }
 
         sendRequest(
@@ -323,7 +337,7 @@ class EndlessService : Service() {
                         log("[response error] ${error?.message}")
                     }
 
-                    if (b.statusCode < 400) {
+                    if (b.statusCode in 200..299) {
                         logs?.forEach { log ->
                             log.enviado = 1
                             log.saveDao()
