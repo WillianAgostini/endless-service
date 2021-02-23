@@ -6,20 +6,26 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.location.Location
-import android.os.Build
-import android.os.IBinder
-import android.os.PowerManager
-import android.os.SystemClock
+import android.os.*
 import android.provider.Settings
 import android.widget.Toast
-import java.text.SimpleDateFormat
-import java.util.*
 import com.github.kittinunf.fuel.Fuel
 import com.github.kittinunf.fuel.core.extensions.jsonBody
-import com.google.android.gms.location.FusedLocationProviderClient
-import com.google.android.gms.location.LocationServices
-import kotlinx.coroutines.*
+import com.google.android.gms.location.*
+import com.orm.SugarContext
+import com.orm.query.Condition
+import com.orm.query.Select
+import com.robertohuertas.endless.dao.IDao
+import com.robertohuertas.endless.dao.LocationDao
+import com.robertohuertas.endless.dao.LogDao
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.*
 
 
 class EndlessService : Service() {
@@ -27,6 +33,22 @@ class EndlessService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var isServiceStarted = false
     private lateinit var fusedLocationClient: FusedLocationProviderClient
+    private var mLocation: Location? = null
+
+    private var locationCallback: LocationCallback? = null
+
+    /**
+     * The desired interval for location updates. Inexact. Updates may be more or less frequent.
+     */
+    private val UPDATE_INTERVAL_IN_MILLISECONDS = (60 * 1000).toLong()
+
+    /**
+     * The fastest rate for active location updates. Updates will never be more frequent
+     * than this value.
+     */
+    private val FASTEST_UPDATE_INTERVAL_IN_MILLISECONDS = UPDATE_INTERVAL_IN_MILLISECONDS / 2
+
+    var locationRequest: LocationRequest? = null
 
     override fun onBind(intent: Intent): IBinder? {
         log("Some component want to bind with the service")
@@ -60,24 +82,80 @@ class EndlessService : Service() {
         startForeground(1, notification)
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
 
+        SugarContext.init(this)
+
+        locationCallback = object : LocationCallback() {
+            override fun onLocationResult(locationResult: LocationResult) {
+                for (location in locationResult.locations) {
+
+                    if(location == null)
+                        continue
+
+                    if(mLocation == null || mLocation!!.time < location.time)
+                        mLocation = location
+
+                    salvarPosicao(location)
+                }
+            }
+        }
+    }
+
+    private fun salvarPosicao(location: Location) {
+        val locationDao = LocationDao()
+        locationDao.longitude = location.longitude
+        locationDao.latitude = location.latitude
+        locationDao.time = location.time
+        locationDao.timeDate = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.mmmZ").format(
+            Date(
+                location.time
+            )
+        )
+        locationDao.enviado = 0
+
+        locationDao.save()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startLocationUpdates() {
+        locationRequest = LocationRequest()
+        locationRequest?.interval = UPDATE_INTERVAL_IN_MILLISECONDS
+        locationRequest?.fastestInterval = FASTEST_UPDATE_INTERVAL_IN_MILLISECONDS
+        locationRequest?.priority = LocationRequest.PRIORITY_HIGH_ACCURACY
+
+        fusedLocationClient.requestLocationUpdates(
+            locationRequest,
+            locationCallback,
+            Looper.getMainLooper()
+        )
     }
 
     override fun onDestroy() {
         super.onDestroy()
         log("The service has been destroyed".toUpperCase())
         Toast.makeText(this, "Service destroyed", Toast.LENGTH_SHORT).show()
+        fusedLocationClient.removeLocationUpdates(locationCallback)
     }
 
     override fun onTaskRemoved(rootIntent: Intent) {
         val restartServiceIntent = Intent(applicationContext, EndlessService::class.java).also {
             it.setPackage(packageName)
-        };
-        val restartServicePendingIntent: PendingIntent = PendingIntent.getService(this, 1, restartServiceIntent, PendingIntent.FLAG_ONE_SHOT);
-        applicationContext.getSystemService(Context.ALARM_SERVICE);
-        val alarmService: AlarmManager = applicationContext.getSystemService(Context.ALARM_SERVICE) as AlarmManager;
-        alarmService.set(AlarmManager.ELAPSED_REALTIME, SystemClock.elapsedRealtime() + 1000, restartServicePendingIntent);
+        }
+        val restartServicePendingIntent: PendingIntent = PendingIntent.getService(
+            this,
+            1,
+            restartServiceIntent,
+            PendingIntent.FLAG_ONE_SHOT
+        )
+        applicationContext.getSystemService(Context.ALARM_SERVICE)
+        val alarmService: AlarmManager =
+            applicationContext.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        alarmService.set(
+            AlarmManager.ELAPSED_REALTIME,
+            SystemClock.elapsedRealtime() + 1000,
+            restartServicePendingIntent
+        )
     }
-    
+
     private fun startService() {
         if (isServiceStarted) return
         log("Starting the foreground service task")
@@ -97,28 +175,100 @@ class EndlessService : Service() {
         GlobalScope.launch(Dispatchers.IO) {
             while (isServiceStarted) {
                 launch(Dispatchers.IO) {
-                    pingFakeServer()
-                    requestLastLocation()
+                    saveLog()
+                    mLocation?.let { salvarPosicao(it) }
+
+                    enviarPosicoesPendentes()
                 }
                 delay(1 * 60 * 1000)
             }
             log("End of the loop for the service")
         }
+
+        startLocationUpdates()
+    }
+
+    @SuppressLint("HardwareIds", "SimpleDateFormat")
+    private fun saveLog() {
+        val gmtTime =
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.mmmZ").format(Date(System.currentTimeMillis()))
+
+        val deviceId = Settings.Secure.getString(
+            applicationContext.contentResolver,
+            Settings.Secure.ANDROID_ID
+        )
+
+        val log = LogDao()
+        log.deviceId = deviceId
+        log.data_computador_bordo = gmtTime
+        log.version = 4
+        log.enviado = 0
+        log.log = getLocation()
+        log.save()
+
+        pingFakeServer()
+    }
+
+    private fun getLocation(): String {
+        if (mLocation == null)
+            return ""
+
+        val json = JSONObject()
+        json.put("getTime", mLocation?.time)
+        json.put("getLongitude", mLocation?.longitude)
+        json.put("getLatitude", mLocation?.latitude)
+        return json.toString()
     }
 
     @SuppressLint("MissingPermission", "HardwareIds")
-    private fun requestLastLocation(){
-        fusedLocationClient.lastLocation
-            .addOnSuccessListener { location : Location? ->
-            val json = JSONObject();
-                json.put("latitude", location?.latitude)
-                json.put("longitude", location?.longitude)
-                json.put("data_computador_bordo", location?.time)
-                json.put("terminal",  Settings.Secure.getString(applicationContext.contentResolver, Settings.Secure.ANDROID_ID))
+    private fun enviarPosicoesPendentes() {
+//        fusedLocationClient.lastLocation
+//            .addOnSuccessListener { location: Location? ->
+//                val json = JSONObject()
+//                json.put("latitude", location?.latitude)
+//                json.put("longitude", location?.longitude)
+//                json.put("data_computador_bordo", location?.time)
+//                json.put(
+//                    "terminal", Settings.Secure.getString(
+//                        applicationContext.contentResolver,
+//                        Settings.Secure.ANDROID_ID
+//                    )
+//                )
+//
+//                sendRequest(
+//                    "http://ec2-54-233-86-218.sa-east-1.compute.amazonaws.com:3000/api/posicoes",
+//                    json.toString()
+//                )
+//            }
 
-            sendRequest("http://ec2-54-233-86-218.sa-east-1.compute.amazonaws.com:3000/api/posicoes", json.toString())
-            }
+        val locations =
+            Select.from(LocationDao::class.java).where(Condition.prop("enviado").eq(0)).limit("25")
+                .list()
+
+        val jsonArray = JSONArray()
+        locations?.forEach { location ->
+
+            val json = JSONObject()
+            json.put("latitude", location?.latitude)
+            json.put("longitude", location?.longitude)
+            json.put("data_computador_bordo", location?.time)
+            json.put(
+                "terminal", Settings.Secure.getString(
+                    applicationContext.contentResolver,
+                    Settings.Secure.ANDROID_ID
+                )
+            )
+            json.put("creationDate", location?.creationDate)
+
+            jsonArray.put(json)
+        }
+
+        sendRequest(
+            "http://ec2-54-233-86-218.sa-east-1.compute.amazonaws.com:3000/api/posicoes",
+            jsonArray.toString(), locations
+        )
     }
+
     private fun stopService() {
         log("Stopping the foreground service")
         Toast.makeText(this, "Service stopping", Toast.LENGTH_SHORT).show()
@@ -138,31 +288,46 @@ class EndlessService : Service() {
     }
 
     private fun pingFakeServer() {
-        val df = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.mmmZ")
-        val gmtTime = df.format(Date())
+        val logs =
+            Select.from(LogDao::class.java).where(Condition.prop("enviado").eq(0)).limit("25")
+                .list()
 
-        val deviceId = Settings.Secure.getString(applicationContext.contentResolver, Settings.Secure.ANDROID_ID)
+        val jsonArray = JSONArray()
+        logs.forEach { log ->
 
-        val json =
-            """
-                {
-                    "deviceId": "$deviceId",
-                    "createdAt": "$gmtTime"
-                }
-            """
-        sendRequest("http://ec2-54-233-86-218.sa-east-1.compute.amazonaws.com:3000/api/log", json)
+            val json = JSONObject()
+            json.put("deviceId", log.deviceId)
+            json.put("data_computador_bordo", log.data_computador_bordo)
+            json.put("version", log.version)
+            json.put("log", log.log)
+            jsonArray.put(json)
+
+        }
+
+        sendRequest(
+            "http://ec2-54-233-86-218.sa-east-1.compute.amazonaws.com:3000/api/log",
+            jsonArray.toString(), logs
+        )
     }
 
-    private fun sendRequest(url:String, json: String) {
+    private fun sendRequest(url: String, json: String, logs: List<IDao>? = null) {
         try {
             Fuel.post(url)
+                .timeout(50 * 1000)
                 .jsonBody(json)
-                .response { _, _, result ->
+                .response { _, b, result ->
                     val (bytes, error) = result
                     if (bytes != null) {
                         log("[response bytes] ${String(bytes)}")
                     } else {
                         log("[response error] ${error?.message}")
+                    }
+
+                    if (b.statusCode < 400) {
+                        logs?.forEach { log ->
+                            log.enviado = 1
+                            log.saveDao()
+                        }
                     }
                 }
         } catch (e: Exception) {
@@ -176,7 +341,8 @@ class EndlessService : Service() {
         // depending on the Android API that we're dealing with we will have
         // to use a specific method to create the notification
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val notificationManager =
+                getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             val channel = NotificationChannel(
                 notificationChannelId,
                 "Endless Service notifications channel",
@@ -192,14 +358,16 @@ class EndlessService : Service() {
             notificationManager.createNotificationChannel(channel)
         }
 
-        val pendingIntent: PendingIntent = Intent(this, MainActivity::class.java).let { notificationIntent ->
-            PendingIntent.getActivity(this, 0, notificationIntent, 0)
-        }
+        val pendingIntent: PendingIntent =
+            Intent(this, MainActivity::class.java).let { notificationIntent ->
+                PendingIntent.getActivity(this, 0, notificationIntent, 0)
+            }
 
-        val builder: Notification.Builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) Notification.Builder(
-            this,
-            notificationChannelId
-        ) else Notification.Builder(this)
+        val builder: Notification.Builder =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) Notification.Builder(
+                this,
+                notificationChannelId
+            ) else Notification.Builder(this)
 
         return builder
             .setContentTitle("Endless Service")

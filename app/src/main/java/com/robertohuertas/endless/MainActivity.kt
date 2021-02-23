@@ -2,10 +2,10 @@ package com.robertohuertas.endless
 
 import android.content.Intent
 import android.os.Build
-import android.support.v7.app.AppCompatActivity
 import android.os.Bundle
-import android.util.Log
+import android.support.v7.app.AppCompatActivity
 import android.widget.Button
+import com.orm.SugarContext
 
 class MainActivity : AppCompatActivity() {
 
@@ -28,6 +28,9 @@ class MainActivity : AppCompatActivity() {
                 actionOnService(Actions.STOP)
             }
         }
+
+        SugarContext.init(this)
+        actionOnService(Actions.START)
     }
 
     private fun actionOnService(action: Actions) {
